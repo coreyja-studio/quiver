@@ -5,6 +5,8 @@ use std::path::Path;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
+// `cargo_bin` is deprecated in assert_cmd 2.x in favor of `cargo_bin` on `Command`
+// from the `CommandCargoPath` trait, but the free function form is simpler for tests.
 #[allow(deprecated)]
 fn quiver() -> Command {
     Command::cargo_bin("quiver").unwrap()
@@ -58,11 +60,30 @@ fn init_is_idempotent() {
     let cfg = config_path(&tmp);
 
     quiver().args(["--config", &cfg, "init"]).assert().success();
+
+    // Add a source to the config so we can verify it's preserved
+    quiver()
+        .args(["--config", &cfg, "add", "/some/path", "mysource"])
+        .assert()
+        .success();
+
+    // Second init should NOT overwrite the config
     quiver()
         .args(["--config", &cfg, "init"])
         .assert()
         .success()
         .stdout(predicates::str::contains("already exists"));
+
+    // Verify the source we added is still present in the config
+    let contents = fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+    assert!(
+        contents.contains("mysource"),
+        "Config was overwritten by second init — source 'mysource' is missing"
+    );
+    assert!(
+        contents.contains("/some/path"),
+        "Config was overwritten by second init — path '/some/path' is missing"
+    );
 }
 
 // --- add tests ---
@@ -313,6 +334,63 @@ fn sync_prunes_stale_symlinks() {
 }
 
 #[test]
+fn sync_transitions_prefixed_to_unprefixed_when_conflict_removed() {
+    let tmp = setup();
+    let cfg = config_path(&tmp);
+    let target = tmp.path().join("target");
+    let src1 = tmp.path().join("src1");
+    let src2 = tmp.path().join("src2");
+
+    fs::create_dir_all(&src1).unwrap();
+    fs::create_dir_all(&src2).unwrap();
+    create_skill(&src1, "bluesky");
+    create_skill(&src2, "bluesky");
+
+    // Config with two sources that conflict on "bluesky"
+    let config_content = format!(
+        "target = \"{}\"\n\n[[source]]\npath = \"{}\"\nname = \"personal\"\n\n[[source]]\npath = \"{}\"\nname = \"team\"\n",
+        target.display(),
+        src1.display(),
+        src2.display()
+    );
+    fs::write(tmp.path().join("config.toml"), &config_content).unwrap();
+
+    // First sync: both sources conflict, so both get prefixed
+    quiver()
+        .args(["--config", &cfg, "sync"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Created: 2"));
+
+    assert!(target.join("personal-bluesky").is_symlink());
+    assert!(target.join("team-bluesky").is_symlink());
+    assert!(!target.join("bluesky").exists());
+
+    // Remove source2 from config — now only one source has "bluesky"
+    let config_content = format!(
+        "target = \"{}\"\n\n[[source]]\npath = \"{}\"\nname = \"personal\"\n",
+        target.display(),
+        src1.display()
+    );
+    fs::write(tmp.path().join("config.toml"), config_content).unwrap();
+
+    // Second sync: no conflict, so "bluesky" should be unprefixed
+    // Old prefixed symlinks should be pruned
+    quiver()
+        .args(["--config", &cfg, "sync"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Created: 1"))
+        .stdout(predicates::str::contains("Pruned: 2"));
+
+    // New unprefixed symlink exists
+    assert!(target.join("bluesky").is_symlink());
+    // Old prefixed symlinks are gone
+    assert!(target.join("personal-bluesky").symlink_metadata().is_err());
+    assert!(target.join("team-bluesky").symlink_metadata().is_err());
+}
+
+#[test]
 fn sync_removes_dead_symlinks() {
     let tmp = setup();
     let cfg = config_path(&tmp);
@@ -338,7 +416,11 @@ fn sync_removes_dead_symlinks() {
         .success()
         .stdout(predicates::str::contains("Pruned: 1"));
 
-    assert!(target.join("dead-skill").symlink_metadata().is_err());
+    // Verify the dead symlink was fully removed (not just broken)
+    assert!(
+        target.join("dead-skill").symlink_metadata().is_err(),
+        "dead symlink should have been pruned entirely"
+    );
 }
 
 #[test]
